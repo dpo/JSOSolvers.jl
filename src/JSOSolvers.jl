@@ -6,6 +6,9 @@ using LinearAlgebra, Logging, Printf
 # JSO packages
 using Krylov, LinearOperators, NLPModels, NLPModelsModifiers, SolverCore, SolverTools
 
+# 3rd-party
+using TSVD
+
 import SolverCore.solve!
 export solve!
 

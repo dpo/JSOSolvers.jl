@@ -1,5 +1,10 @@
 export trunk, TrunkSolver
 
+function LinearAlgebra.opnorm(B; kwargs...)
+  _, s, _ = tsvd(B)
+  return s[1]
+end
+
 trunk(nlp::AbstractNLPModel; variant = :Newton, kwargs...) = trunk(Val(variant), nlp; kwargs...)
 
 """
@@ -82,12 +87,14 @@ mutable struct TrunkSolver{
   Hs::V
   subsolver::Sub
   H::Op
-  tr::TrustRegion{T, V}
+  tr::ComplexityTrustRegion{T, V}
 end
 
 function TrunkSolver(
   nlp::AbstractNLPModel{T, V};
   subsolver_type::Type{<:KrylovSolver} = CgSolver,
+  α::T = zero(T),
+  β::T = zero(T),
 ) where {T, V <: AbstractVector{T}}
   nvar = nlp.meta.nvar
   x = V(undef, nvar)
@@ -100,13 +107,13 @@ function TrunkSolver(
   Sub = typeof(subsolver)
   H = hess_op!(nlp, x, Hs)
   Op = typeof(H)
-  tr = TrustRegion(gt, one(T))
+  tr = ComplexityTrustRegion(gt, one(T), α = α, β = β)
   return TrunkSolver{T, V, Sub, Op}(x, xt, gx, gt, gn, Hs, subsolver, H, tr)
 end
 
 function SolverCore.reset!(solver::TrunkSolver)
   solver.tr.good_grad = false
-  solver.tr.radius = solver.tr.initial_radius
+  solver.tr.Δ = solver.tr.Δ₀
   solver
 end
 
@@ -114,18 +121,20 @@ function SolverCore.reset!(solver::TrunkSolver, nlp::AbstractNLPModel)
   @assert (length(solver.gn) == 0) || isa(nlp, QuasiNewtonModel)
   solver.H = hess_op!(nlp, solver.x, solver.Hs)
   solver.tr.good_grad = false
-  solver.tr.radius = solver.tr.initial_radius
+  solver.tr.Δ = solver.tr.Δ₀
   solver
 end
 
 @doc (@doc TrunkSolver) function trunk(
   ::Val{:Newton},
-  nlp::AbstractNLPModel;
+  nlp::AbstractNLPModel{T, V};
   x::V = nlp.meta.x0,
   subsolver_type::Type{<:KrylovSolver} = CgSolver,
+  α::T = zero(T),
+  β::T = zero(T),
   kwargs...,
-) where {V}
-  solver = TrunkSolver(nlp, subsolver_type = subsolver_type)
+) where {T, V}
+  solver = TrunkSolver(nlp, subsolver_type = subsolver_type, α = α, β = β)
   return solve!(solver, nlp; x = x, kwargs...)
 end
 
@@ -179,9 +188,10 @@ function SolverCore.solve!(
   grad!(nlp, x, ∇f)
   isa(nlp, QuasiNewtonModel) && (∇fn .= ∇f)
   ∇fNorm2 = nrm2(n, ∇f)
+  HNorm2 = tr.β == zero(T) ? one(T) : opnorm(H)  # do not compute unless necessary
   ϵ = atol + rtol * ∇fNorm2
   tr = solver.tr
-  tr.radius = min(max(∇fNorm2 / 10, one(T)), T(100))
+  SolverTools.set_radius!(tr, ∇fNorm2, HNorm2)
 
   # Non-monotone mode parameters.
   # fmin: current best overall objective value
@@ -200,11 +210,11 @@ function SolverCore.solve!(
   unbounded = f < fmin
 
   verbose > 0 && @info log_header(
-    [:iter, :f, :dual, :radius, :ratio, :inner, :bk, :cgstatus],
-    [Int, T, T, T, T, Int, Int, String],
-    hdr_override = Dict(:f => "f(x)", :dual => "π", :radius => "Δ"),
+    [:iter, :f, :dual, :H, :Δ, :radius, :ratio, :inner, :bk, :cgstatus],
+    [Int, T, T, T, T, T, T, Int, Int, String],
+    hdr_override = Dict(:dual => "‖∇f‖", :H => "‖H‖"),
   )
-  verbose > 0 && @info log_row([stats.iter, f, ∇fNorm2, T, T, Int, Int, String])
+  verbose > 0 && @info log_row([stats.iter, f, ∇fNorm2, tr.β == zero(T) ? T : HNorm2, T, T, T, Int, Int, String])
 
   set_status!(
     stats,
@@ -294,10 +304,12 @@ function SolverCore.solve!(
         copyaxpy!(n, α, s, x, xt)
         ft = obj(nlp, xt)
       end
-      sNorm *= α
-      scal!(n, α, s)
-      slope *= α
-      Δq = slope + α * α * curv / 2
+      if (bk > 0)
+        sNorm *= α
+        scal!(n, α, s)
+        slope *= α
+        Δq = slope + α * α * curv / 2
+      end
       ared, pred = aredpred!(tr, nlp, f, ft, Δq, xt, s, slope)
       if pred ≥ 0
         stats.status = :neg_pred
@@ -365,6 +377,7 @@ function SolverCore.solve!(
         push!(nlp, s, ∇fn)
         ∇fn .= ∇f
       end
+      HNorm2 = tr.β == zero(T) ? one(T) : opnorm(H)  # do not compute unless necessary
 
       verbose > 0 &&
         mod(stats.iter, verbose) == 0 &&
@@ -372,6 +385,8 @@ function SolverCore.solve!(
           stats.iter,
           f,
           ∇fNorm2,
+          tr.β == zero(T) ? T : HNorm2,
+          tr.Δ,
           tr.radius,
           tr.ratio,
           length(cg_stats.residuals),
@@ -381,7 +396,7 @@ function SolverCore.solve!(
     end
 
     # Move on.
-    update!(tr, sNorm)
+    update!(tr, ∇fNorm2, HNorm2)
 
     optimal = ∇fNorm2 ≤ ϵ
     unbounded = f < fmin
